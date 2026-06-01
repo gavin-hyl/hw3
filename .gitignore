@@ -16,9 +16,10 @@ env/
 # Notebooks
 .ipynb_checkpoints/
 
-# Local Codex state
+# Local Codex / Claude state
 .codex
 .codex/
+.claude/
 
 # Data and experiment outputs
 /data/*
@@ -39,3 +40,5 @@ env/
 # OS/editor files
 .DS_Store
 Thumbs.db
+
+*.pdf

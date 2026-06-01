@@ -21,6 +21,8 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
+from vlm.masking import build_image_bidir_mask
+
 InjectionMode = Literal["cls", "all_patches", "interleaved"]
 MaskMode = Literal["causal", "image_bidir"]
 
@@ -69,6 +71,110 @@ class VisionLanguageModel(nn.Module):
         self.tokenizer = tokenizer
         self.image_token_id = image_token_id
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _encode_visual(self, images: torch.Tensor, injection: InjectionMode) -> torch.Tensor:
+        """Run the ViT + projector. Returns visual tokens (B, N_vis, d_decoder)."""
+        if injection == "cls":
+            feats = self.vit(images)                       # (B, d_image)
+        else:  # all_patches / interleaved use the full token sequence
+            feats = self.vit(images, return_all_tokens=True)  # (B, N+1, d_image)
+        visual = self.projector(feats)                     # (B, N_vis, d_decoder)
+        embed_dtype = self.decoder.get_input_embeddings().weight.dtype
+        return visual.to(embed_dtype)
+
+    def _prefix_inject(self, visual, text_embeds, attention_mask, labels):
+        """Prepend visual tokens to the text sequence (cls / all_patches)."""
+        B, n_vis, _ = visual.shape
+        inputs_embeds = torch.cat([visual, text_embeds], dim=1)
+        vis_mask = torch.ones(B, n_vis, dtype=attention_mask.dtype, device=attention_mask.device)
+        full_mask = torch.cat([vis_mask, attention_mask], dim=1)
+        full_labels = None
+        if labels is not None:
+            vis_labels = torch.full((B, n_vis), -100, dtype=labels.dtype, device=labels.device)
+            full_labels = torch.cat([vis_labels, labels], dim=1)
+        return inputs_embeds, full_mask, full_labels, n_vis
+
+    def _interleave_inject(self, visual, input_ids, text_embeds, attention_mask, labels):
+        """Replace the single <image> placeholder token with the visual sequence."""
+        assert self.image_token_id is not None, "interleaved mode needs image_token_id"
+        B = input_ids.shape[0]
+        embed_dtype = text_embeds.dtype
+        rows_e, rows_m, rows_l = [], [], []
+        for b in range(B):
+            pos = (input_ids[b] == self.image_token_id).nonzero(as_tuple=True)[0]
+            assert len(pos) == 1, "expected exactly one <image> token per example"
+            p = int(pos[0])
+            te, am = text_embeds[b], attention_mask[b]
+            e = torch.cat([te[:p], visual[b], te[p + 1:]], dim=0)
+            n_vis = visual.shape[1]
+            m = torch.cat([
+                am[:p],
+                torch.ones(n_vis, dtype=am.dtype, device=am.device),
+                am[p + 1:],
+            ], dim=0)
+            rows_e.append(e)
+            rows_m.append(m)
+            if labels is not None:
+                lb = labels[b]
+                l = torch.cat([
+                    lb[:p],
+                    torch.full((n_vis,), -100, dtype=lb.dtype, device=lb.device),
+                    lb[p + 1:],
+                ], dim=0)
+                rows_l.append(l)
+        # Right-pad to the longest stitched sequence.
+        T = max(e.shape[0] for e in rows_e)
+        def pad(seq, value, dtype):
+            out = torch.full((B, T, *seq[0].shape[1:]), value, dtype=dtype, device=seq[0].device)
+            for b, s in enumerate(seq):
+                out[b, : s.shape[0]] = s
+            return out
+        inputs_embeds = pad(rows_e, 0.0, embed_dtype)
+        full_mask = pad(rows_m, 0, attention_mask.dtype)
+        full_labels = pad(rows_l, -100, labels.dtype) if labels is not None else None
+        return inputs_embeds, full_mask, full_labels
+
+    def _build_inputs(self, images, input_ids, attention_mask, labels, injection):
+        visual = self._encode_visual(images, injection)
+        text_embeds = self.decoder.get_input_embeddings()(input_ids)
+        if injection == "interleaved":
+            inputs_embeds, full_mask, full_labels = self._interleave_inject(
+                visual, input_ids, text_embeds, attention_mask, labels
+            )
+            n_vis = visual.shape[1]  # contiguous block per example (used only for prefix bidir)
+        else:
+            inputs_embeds, full_mask, full_labels, n_vis = self._prefix_inject(
+                visual, text_embeds, attention_mask, labels
+            )
+        return inputs_embeds, full_mask, full_labels, n_vis
+
+    def _attention_mask(self, full_mask, n_vis, mask_mode, dtype):
+        """Return the attention mask to pass to the decoder.
+
+        - causal: the 2D padding mask (decoder adds its own causal mask).
+        - image_bidir: a 4D additive mask, bidirectional inside the visual prefix
+          and causal everywhere else, merged with padding.
+        """
+        if mask_mode == "causal":
+            return full_mask
+        B, T = full_mask.shape
+        device = full_mask.device
+        base = build_image_bidir_mask(n_vis, T - n_vis, device, dtype)  # (1,1,T,T)
+        # Merge padding: padded key positions are never attended to.
+        pad_add = torch.where(
+            full_mask[:, None, None, :].bool(),
+            torch.zeros((), dtype=dtype, device=device),
+            torch.full((), torch.finfo(dtype).min, dtype=dtype, device=device),
+        )  # (B,1,1,T)
+        return base + pad_add  # (B,1,T,T)
+
+    # ------------------------------------------------------------------
+    # Forward / generate
+    # ------------------------------------------------------------------
+
     def forward(
         self,
         images: torch.Tensor,
@@ -78,21 +184,19 @@ class VisionLanguageModel(nn.Module):
         injection: InjectionMode = "cls",
         mask_mode: MaskMode = "causal",
     ) -> dict:
-        # TODO: implement.
-        # Sketch:
-        #   1. Encode images with self.vit to get visual features.
-        #      - "cls" -> (B, 1, d_image)
-        #      - "all_patches" / "interleaved" -> (B, N+1, d_image)
-        #        (you'll need to add a `return_all_tokens=True` flag to your ViT)
-        #   2. Project to decoder dim with self.projector.
-        #   3. Get text embeddings from the decoder's embed layer.
-        #   4. Stitch visual and text tokens together according to `injection`.
-        #   5. If `mask_mode == "image_bidir"`, build a custom 4D attention mask
-        #      with vlm.masking.build_image_bidir_mask() and pass it to the
-        #      decoder. Otherwise let the decoder use its default causal mask.
-        #   6. Run the decoder with inputs_embeds=stitched, labels=adjusted_labels.
-        #   7. Return {"loss": ..., "logits": ...}.
-        raise NotImplementedError
+        inputs_embeds, full_mask, full_labels, n_vis = self._build_inputs(
+            images, input_ids, attention_mask, labels, injection
+        )
+        attn = self._attention_mask(full_mask, n_vis, mask_mode, inputs_embeds.dtype)
+        outputs = self.decoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attn,
+            labels=full_labels,
+        )
+        out = {"logits": outputs.logits}
+        if full_labels is not None:
+            out["loss"] = outputs.loss
+        return out
 
     @torch.no_grad()
     def generate(
@@ -107,5 +211,18 @@ class VisionLanguageModel(nn.Module):
 
         Useful for §5's qualitative evaluation problem (vlm_qualitative).
         """
-        # TODO: implement.
-        raise NotImplementedError
+        device = next(self.decoder.parameters()).device
+        enc = self.tokenizer(prompts, return_tensors="pt", padding=True)
+        input_ids = enc["input_ids"].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+        inputs_embeds, full_mask, _, _ = self._build_inputs(
+            images.to(device), input_ids, attention_mask, labels=None, injection=injection
+        )
+        gen = self.decoder.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=full_mask,
+            max_new_tokens=max_new_tokens,
+            pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+            **gen_kwargs,
+        )
+        return self.tokenizer.batch_decode(gen, skip_special_tokens=True)
